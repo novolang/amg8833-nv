@@ -22,6 +22,14 @@ the bottom right, is the specification's drawing and is NOT VERIFIED on a part.
 novo pkg add amg8833-nv
 ```
 
+The device program is `examples/thermal_reader.nv`.  Make it the `main` of a
+package that depends on this one and build it for a board:
+
+```sh
+novo build --target=nrf52840-dk src/main.nv
+novo build --target=nrf54lm20-dk src/main.nv
+```
+
 ## The device program
 
 `examples/thermal_reader.nv` brings the sensor up at 10 frames a second and prints a
@@ -186,7 +194,8 @@ it in millidegrees, rounded to the nearest.
 
 ## Tests
 
-`tests/amg8833_tests.nv` checks the thermistor and pixel conversions against the tables
+`novo test --isolate tests/amg8833_tests.nv` runs the suite on the host.
+It checks the thermistor and pixel conversions against the tables
 the specification prints in section 4-10 (the thermistor's 0x7D0, 0x190, 0x004, 0x804
 and 0x940; the pixel's 0x1F4, 0x064, 0x001, 0xFFF, 0xF9C and 0xF24), the unlock sequence of
 the moving average, the six level writes, the frame as one read of 128 bytes, and every
