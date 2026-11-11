@@ -1,0 +1,98 @@
+/* thermal_reader.nv: a reading loop that prints the thermistor and the hottest
+ * pixel of an AMG8833 Grid-EYE thermal array, ten times a second
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          amg8833-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The sensor is an AMG8833 on a breakout (Adafruit 3538, SparkFun SEN-14607,
+ * Pimoroni): SDA and SCL to the board's first I2C bus, power to 3.3 V and ground.
+ * The AD_SELECT pin on VDD puts the part at 0x69; on GND at 0x68.  A line looks
+ * like
+ *
+ *     ambient 25 C  hottest 31 C at row 3 col 4
+ *
+ * with whole degrees Celsius, and the row and column counted from 0 at the top
+ * left of the array as the specification draws it.
+ *
+ * The program reads the thermistor through devices-nv's Thermometer trait and
+ * the frame through `Amg8833.frame`, which fills a buffer of 64 millidegree
+ * values that the program owns.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the UART and the timer.
+ * It allocates nothing after it starts.
+ *
+ * Boards: the nRF52840 DK and the nRF54LM20 DK build this program, and both drive
+ * I2C with a TWIM (docs/hal/README.md, "The Nordic DKs' buses").  No board on the
+ * bench carries the sensor; it has not been read on a board.
+ */
+use embedded_hal.{ BoardI2c, BoardTimer }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_bus
+use amg8833.{ Amg8833, AmgFrame }
+
+// Writes `n`, 0 or more, in decimal.  Formatting into a string would allocate,
+// which @tier(embedded) refuses, so each digit goes out as a byte.  An Int has
+// at most 19 decimal digits, which bounds both loops.
+@tier(embedded)
+fn digits(n: Int) [hw]
+    var div = 1
+    for _k in 0..18
+        if div <= n / 10
+            div = div * 10
+    for _k in 0..19
+        if div > 0
+            hal.uart.write_byte(48 + n / div % 10)
+            div = div / 10
+
+// Writes a temperature in whole degrees, rounded toward zero, with a minus sign.
+@tier(embedded)
+fn degrees(milli_c: Int) [hw]
+    var m = milli_c
+    if m < 0
+        hal.uart.write("-")
+        m = -m
+    digits(m / 1000)
+
+// The index of the hottest pixel of the frame.
+@tier(embedded)
+fn hottest(var frame: AmgFrame) -> Int
+    var best = 0
+    for i in 1..64
+        if frame[i] > frame[best]
+            best = i
+    best
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    let sensor = Amg8833.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, dev_bus.wiring_i2c(0, 0x69))
+    // The part needs 50 ms after its supply before it answers; `begin` waits for
+    // the first frame as well.
+    hal.timer.delay_ms(50)
+    if not sensor.begin()
+        hal.uart.write("no answer from the sensor at 0x69\n")
+    var frame: AmgFrame = Vec.new()
+    while true
+        if sensor.frame(var frame)
+            match sensor.temp_read()
+                Some(t) =>
+                    hal.uart.write("ambient ")
+                    degrees(t.milli_c)
+                None    => hal.uart.write("ambient ?")
+            let h = hottest(var frame)
+            hal.uart.write(" C  hottest ")
+            degrees(frame[h])
+            // The index counts back from pixel 64 at the top left.
+            hal.uart.write(" C at row ")
+            digits((63 - h) / 8)
+            hal.uart.write(" col ")
+            digits((63 - h) % 8)
+            hal.uart.write("\n")
+        else
+            hal.uart.write("no answer\n")
+        hal.timer.delay_ms(100)

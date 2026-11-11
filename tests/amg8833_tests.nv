@@ -1,0 +1,533 @@
+// amg8833_tests — the driver over a double of the part: a flat file of 256
+// 8-bit registers.  The conversions are checked against the examples that
+// "Specifications for Infrared Array Sensor Grid-EYE AMG88**" (Panasonic,
+// Aug. 30, 2011) prints in section 4-10: the thermistor table of (9) and the
+// pixel table of (11).
+//
+// Log entries: a write is 1, the register, the value, -1; a read is 2, the
+// register, the count, -1; a pause is 3, the milliseconds, -1.
+//
+//   st 0 transactions   1 the transaction that fails   2 the bus clock
+//   3 log length   4 the address the part answers at   5 1 when the bus cannot be set up
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardTimer, I2cBus }
+use dev_bus.{ DeviceWiring }
+use dev_thermo.{ TempMilliC, Thermometer }
+use amg8833
+use amg8833.{ Amg8833, AmgPort, AmgBytes, AmgFrame }
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), log: HashMap.new() }
+    c.st.insert(4, 0x69)
+    c
+
+fn logp(c: Chip, v: Int)
+    let n = at(c.st, 3)
+    c.log.insert(n, v)
+    c.st.insert(3, n + 1)
+
+@tier(app)
+fn log_of(c: Chip) -> [Int]
+    var out: [Int] = []
+    for i in 0..at(c.st, 3)
+        list.push(out, at(c.log, i))
+    out
+
+fn log_clear(c: Chip)
+    c.st.insert(3, 0)
+
+fn fails(c: Chip) -> Bool
+    let n = at(c.st, 0) + 1
+    c.st.insert(0, n)
+    at(c.st, 1) == n
+
+// Makes the transaction `k` counted from now fail.
+fn fail_at(c: Chip, k: Int)
+    c.st.insert(1, at(c.st, 0) + k)
+
+// The port: the registers are the chip's.
+struct FakePort
+    c: Chip
+
+impl AmgPort for FakePort
+    fn setup(self) -> Bool [hw]
+        logp(self.c, 0)
+        at(self.c.st, 5) == 0
+
+    fn read_regs(self, reg: Int, n: Int, var dst: AmgBytes) -> Bool [hw]
+        dst.clear()
+        logp(self.c, 2)
+        logp(self.c, reg)
+        logp(self.c, n)
+        logp(self.c, -1)
+        if fails(self.c)
+            return false
+        for i in 0..n
+            let _ = dst.push(at(self.c.regs, reg + i) as u8)
+        true
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        logp(self.c, 1)
+        logp(self.c, reg)
+        logp(self.c, v)
+        logp(self.c, -1)
+        if fails(self.c)
+            return false
+        self.c.regs.insert(reg, v)
+        true
+
+    fn pause_ms(self, ms: Int) [hw]
+        logp(self.c, 3)
+        logp(self.c, ms)
+        logp(self.c, -1)
+
+fn port() -> FakePort
+    FakePort { c: chip() }
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+@test
+fn test_the_thermistor_follows_the_table_of_the_specification() [io]
+    // Section 4-10 (9): +125 is 0x7D0, +25 is 0x190, +0.25 is 0x004, 0 is 0,
+    // -0.25 is 0x804, -20 is 0x940.
+    test.assert_eq(amg8833.thermistor_milli_c(0x7D0), 125000)
+    test.assert_eq(amg8833.thermistor_milli_c(0x190), 25000)
+    test.assert_eq(amg8833.thermistor_milli_c(0x004), 250)
+    test.assert_eq(amg8833.thermistor_milli_c(0x000), 0)
+    test.assert_eq(amg8833.thermistor_milli_c(0x804), -250)
+    test.assert_eq(amg8833.thermistor_milli_c(0x940), -20000)
+    // One count is 62.5 millidegrees, rounded half away from zero.
+    test.assert_eq(amg8833.thermistor_milli_c(1), 63)
+    test.assert_eq(amg8833.thermistor_milli_c(0x801), -63)
+    test.assert_eq(amg8833.thermistor_milli_c(2), 125)
+    // Bits above the twelfth are not part of the value.
+    test.assert_eq(amg8833.thermistor_milli_c(0xF190), 25000)
+
+@test
+fn test_a_pixel_follows_the_table_of_the_specification() [io]
+    // Section 4-10 (11): +125 is 0x1F4, +25 is 0x064, +0.25 is 0x001, 0 is 0,
+    // -0.25 is 0xFFF, -25 is 0xF9C, -55 is 0xF24.
+    test.assert_eq(amg8833.pixel_milli_c(0x1F4), 125000)
+    test.assert_eq(amg8833.pixel_milli_c(0x064), 25000)
+    test.assert_eq(amg8833.pixel_milli_c(0x001), 250)
+    test.assert_eq(amg8833.pixel_milli_c(0x000), 0)
+    test.assert_eq(amg8833.pixel_milli_c(0xFFF), -250)
+    test.assert_eq(amg8833.pixel_milli_c(0xF9C), -25000)
+    test.assert_eq(amg8833.pixel_milli_c(0xF24), -55000)
+    test.assert_eq(amg8833.s12(0x7FF), 2047)
+    test.assert_eq(amg8833.s12(0x800), -2048)
+
+@test
+fn test_a_level_is_a_twelve_bit_two_s_complement_count_of_a_quarter_degree() [io]
+    test.assert_eq(amg8833.level_raw(25000), 100)
+    test.assert_eq(amg8833.level_raw(-25000), 0xF9C)
+    test.assert_eq(amg8833.level_raw(0), 0)
+    // The nearest count, half away from zero.
+    test.assert_eq(amg8833.level_raw(124), 0)
+    test.assert_eq(amg8833.level_raw(125), 1)
+    test.assert_eq(amg8833.level_raw(-124), 0)
+    test.assert_eq(amg8833.level_raw(-125), 0xFFF)
+    // The ends: 511.75 degrees and -512 degrees; one count beyond is refused.
+    test.assert_eq(amg8833.level_raw(511750), 0x7FF)
+    test.assert_eq(amg8833.level_raw(-512000), 0x800)
+    test.assert_eq(amg8833.level_raw(512000), -1)
+    test.assert_eq(amg8833.level_raw(-512500), -1)
+    test.assert_eq(amg8833.level_milli_c(0xF9C), -25000)
+    test.assert_eq(amg8833.level_milli_c(100), 25000)
+
+@test
+fn test_a_pixel_is_found_by_row_and_column_from_the_top_left() [io]
+    // Section 4-7 draws pixel 64 at the top left and pixel 1 at the bottom
+    // right; the frame index is the pixel number less one.
+    test.assert_eq(amg8833.pixel_index(0, 0), 63)
+    test.assert_eq(amg8833.pixel_index(7, 7), 0)
+    test.assert_eq(amg8833.pixel_index(7, 0), 7)
+    test.assert_eq(amg8833.pixel_index(0, 7), 56)
+    test.assert_eq(amg8833.pixel_index(-1, 0), -1)
+    test.assert_eq(amg8833.pixel_index(8, 0), -1)
+    test.assert_eq(amg8833.pixel_index(0, -1), -1)
+    test.assert_eq(amg8833.pixel_index(0, 8), -1)
+
+// ── Registers ────────────────────────────────────────────────────────
+
+@test
+fn test_the_four_power_modes_are_written_and_the_part_is_given_50_ms() [io, hw]
+    let p = port()
+    test.assert(amg8833.power_set(p, 0x00))
+    test.assert_eq(log_of(p.c), [1, 0x00, 0x00, -1, 3, 50, -1])
+    log_clear(p.c)
+    test.assert(amg8833.power_set(p, 0x10))
+    test.assert(amg8833.power_set(p, 0x20))
+    test.assert(amg8833.power_set(p, 0x21))
+    test.assert_eq(at(p.c.regs, 0), 0x21)
+    log_clear(p.c)
+    // Any other value is refused without a write.
+    test.assert(not amg8833.power_set(p, 0x30))
+    test.assert(not amg8833.power_set(p, 0x11))
+    test.assert(not amg8833.power_set(p, 0x22))
+    test.assert_eq(log_of(p.c).len(), 0)
+    // A write that is not acknowledged is reported, and the wait is still made.
+    fail_at(p.c, 1)
+    test.assert(not amg8833.power_set(p, 0x00))
+    test.assert_eq(log_of(p.c), [1, 0x00, 0x00, -1, 3, 50, -1])
+
+@test
+fn test_the_power_mode_is_read_back() [io, hw]
+    let p = port()
+    p.c.regs.insert(0, 0x20)
+    test.assert_eq(amg8833.power_get(p), 0x20)
+    fail_at(p.c, 1)
+    test.assert_eq(amg8833.power_get(p), -1)
+
+@test
+fn test_the_two_resets_write_their_commands_and_wait_2_ms() [io, hw]
+    let p = port()
+    test.assert(amg8833.reset(p, false))
+    test.assert_eq(log_of(p.c), [1, 0x01, 0x30, -1, 3, 2, -1])
+    log_clear(p.c)
+    test.assert(amg8833.reset(p, true))
+    test.assert_eq(log_of(p.c), [1, 0x01, 0x3F, -1, 3, 2, -1])
+
+@test
+fn test_the_frame_rate_is_one_or_ten_a_second() [io, hw]
+    let p = port()
+    test.assert(amg8833.rate_set(p, 1))
+    test.assert_eq(at(p.c.regs, 2), 1)
+    test.assert_eq(amg8833.rate_get(p), 1)
+    test.assert_eq(amg8833.period_us(p), 1000000)
+    test.assert(amg8833.rate_set(p, 10))
+    test.assert_eq(at(p.c.regs, 2), 0)
+    test.assert_eq(amg8833.rate_get(p), 10)
+    test.assert_eq(amg8833.period_us(p), 100000)
+    log_clear(p.c)
+    test.assert(not amg8833.rate_set(p, 5))
+    test.assert(not amg8833.rate_set(p, 0))
+    test.assert_eq(log_of(p.c).len(), 0)
+    // Bits above bit 0 of the register are not the rate.
+    p.c.regs.insert(2, 0xFE)
+    test.assert_eq(amg8833.rate_get(p), 10)
+    fail_at(p.c, 1)
+    test.assert_eq(amg8833.rate_get(p), 0)
+    fail_at(p.c, 1)
+    test.assert_eq(amg8833.period_us(p), 0)
+
+@test
+fn test_the_moving_average_is_unlocked_before_it_is_set() [io, hw]
+    let p = port()
+    test.assert(amg8833.average_set(p, true))
+    // Section 4-10 (7): 0x50, 0x45, 0x57 to 0x1F, 0x20 to 0x07, 0x00 to 0x1F.
+    test.assert_eq(log_of(p.c),
+        [1, 0x1F, 0x50, -1, 1, 0x1F, 0x45, -1, 1, 0x1F, 0x57, -1, 1, 0x07, 0x20, -1, 1, 0x1F, 0x00, -1])
+    test.assert(amg8833.average_get(p))
+    log_clear(p.c)
+    test.assert(amg8833.average_set(p, false))
+    test.assert_eq(at(p.c.regs, 7), 0)
+    test.assert(not amg8833.average_get(p))
+    fail_at(p.c, 1)
+    test.assert(not amg8833.average_get(p))
+
+@test
+fn test_a_write_that_fails_ends_the_moving_average_sequence_there() [io, hw]
+    var k = 1
+    while k <= 5
+        let p = port()
+        fail_at(p.c, k)
+        test.assert(not amg8833.average_set(p, true))
+        // The sequence stops at the write that failed.
+        test.assert_eq(log_of(p.c).len(), 4 * k)
+        k = k + 1
+
+@test
+fn test_the_interrupt_control_register_takes_the_enable_and_the_mode() [io, hw]
+    let p = port()
+    test.assert(amg8833.interrupt_set(p, false, false))
+    test.assert_eq(at(p.c.regs, 3), 0)
+    test.assert(amg8833.interrupt_set(p, true, false))
+    test.assert_eq(at(p.c.regs, 3), 1)
+    test.assert(amg8833.interrupt_set(p, false, true))
+    test.assert_eq(at(p.c.regs, 3), 2)
+    test.assert(amg8833.interrupt_set(p, true, true))
+    test.assert_eq(at(p.c.regs, 3), 3)
+
+@test
+fn test_the_levels_are_written_a_register_at_a_time_in_two_s_complement() [io, hw]
+    let p = port()
+    // 30 degrees upper, -5 degrees lower, 1 degree hysteresis.
+    test.assert(amg8833.levels_set(p, 30000, -5000, 1000))
+    test.assert_eq(log_of(p.c), [1,
+        0x08,
+        120,
+        -1,
+        1,
+        0x09,
+        0,
+        -1,
+        1,
+        0x0A,
+        0xEC,
+        -1,
+        1,
+        0x0B,
+        0x0F,
+        -1,
+        1,
+        0x0C,
+        4,
+        -1,
+        1,
+        0x0D,
+        0,
+        -1])
+    var out: Vec[Int; 3] = Vec.new()
+    test.assert(amg8833.levels_get(p, var out))
+    test.assert_eq(out.len(), 3)
+    test.assert_eq(out[0], 30000)
+    test.assert_eq(out[1], -5000)
+    test.assert_eq(out[2], 1000)
+
+@test
+fn test_a_level_out_of_range_or_a_negative_hysteresis_is_refused() [io, hw]
+    let p = port()
+    test.assert(not amg8833.levels_set(p, 600000, 0, 0))
+    test.assert(not amg8833.levels_set(p, 0, -600000, 0))
+    test.assert(not amg8833.levels_set(p, 0, 0, 600000))
+    test.assert(not amg8833.levels_set(p, 0, 0, -250))
+    test.assert_eq(log_of(p.c).len(), 0)
+
+@test
+fn test_a_write_that_fails_ends_the_levels_there() [io, hw]
+    var k = 1
+    while k <= 6
+        let p = port()
+        fail_at(p.c, k)
+        test.assert(not amg8833.levels_set(p, 30000, -5000, 1000))
+        test.assert_eq(log_of(p.c).len(), 4 * k)
+        k = k + 1
+
+@test
+fn test_the_levels_are_none_when_the_part_does_not_answer() [io, hw]
+    let p = port()
+    fail_at(p.c, 1)
+    var out: Vec[Int; 3] = Vec.new()
+    let _ = out.push(7)
+    test.assert(not amg8833.levels_get(p, var out))
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_the_status_flags_are_read_and_cleared_by_mask() [io, hw]
+    let p = port()
+    p.c.regs.insert(4, 0xFF)
+    test.assert_eq(amg8833.status_get(p), 0x0E)
+    p.c.regs.insert(4, 0x02)
+    test.assert_eq(amg8833.status_get(p), 0x02)
+    fail_at(p.c, 1)
+    test.assert_eq(amg8833.status_get(p), -1)
+    log_clear(p.c)
+    test.assert(amg8833.status_clear(p, 0xFF))
+    test.assert_eq(log_of(p.c), [1, 0x05, 0x0E, -1])
+    test.assert(amg8833.status_clear(p, 0x02))
+    test.assert_eq(at(p.c.regs, 5), 0x02)
+
+@test
+fn test_the_interrupt_table_flags_the_pixels_over_a_level() [io, hw]
+    let p = port()
+    // Pixel 12 is bit 3 of INT1 (0x11).
+    p.c.regs.insert(0x11, 0x08)
+    p.c.regs.insert(0x17, 0x80)
+    var t: AmgBytes = Vec.new()
+    test.assert(amg8833.table_get(p, var t))
+    test.assert_eq(t.len(), 8)
+    test.assert(amg8833.table_flag(var t, 11))
+    test.assert(amg8833.table_flag(var t, 63))
+    test.assert(not amg8833.table_flag(var t, 10))
+    test.assert(not amg8833.table_flag(var t, 0))
+    test.assert(not amg8833.table_flag(var t, -1))
+    test.assert(not amg8833.table_flag(var t, 64))
+    var empty: AmgBytes = Vec.new()
+    test.assert(not amg8833.table_flag(var empty, 11))
+    fail_at(p.c, 1)
+    test.assert(not amg8833.table_get(p, var t))
+
+@test
+fn test_the_thermistor_is_read_as_sign_and_magnitude() [io, hw]
+    let p = port()
+    p.c.regs.insert(0x0E, 0x90)
+    p.c.regs.insert(0x0F, 0x01)
+    test.assert_eq(amg8833.thermistor_read(p) ?? -1, 25000)
+    test.assert_eq(log_of(p.c), [2, 0x0E, 2, -1])
+    p.c.regs.insert(0x0E, 0x40)
+    p.c.regs.insert(0x0F, 0x09)
+    test.assert_eq(amg8833.thermistor_read(p) ?? 0, -20000)
+    fail_at(p.c, 1)
+    test.assert(amg8833.thermistor_read(p) == None)
+
+fn tempc(o: ?TempMilliC) -> Int
+    match o
+        Some(t) => t.milli_c
+        None    => -99999
+
+@test
+fn test_the_thermistor_is_a_thermometer() [io, hw]
+    let p = port()
+    p.c.regs.insert(0x0E, 0x90)
+    p.c.regs.insert(0x0F, 0x01)
+    test.assert_eq(tempc(amg8833.temp_of(p)), 25000)
+    fail_at(p.c, 1)
+    test.assert_eq(tempc(amg8833.temp_of(p)), -99999)
+
+@test
+fn test_a_frame_is_one_read_of_128_bytes_from_0x80() [io, hw]
+    let p = port()
+    // Pixel n holds the count n * 4 less 100: 25 degrees at pixel 25, and the
+    // low pixels are below zero.
+    for n in 1..65
+        let raw = (n * 4 - 100) & 0xFFF
+        p.c.regs.insert(0x80 + 2 * (n - 1), raw & 0xFF)
+        p.c.regs.insert(0x81 + 2 * (n - 1), (raw >> 8) & 0x0F)
+    var out: AmgFrame = Vec.new()
+    test.assert(amg8833.frame_read(p, var out))
+    test.assert_eq(log_of(p.c), [2, 0x80, 128, -1])
+    test.assert_eq(out.len(), 64)
+    test.assert_eq(out[24], 0)
+    test.assert_eq(out[0], -24000)
+    test.assert_eq(out[63], 39000)
+    // A part that does not answer leaves the buffer empty.
+    fail_at(p.c, 1)
+    test.assert(not amg8833.frame_read(p, var out))
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_bring_up_follows_the_order_of_the_reference_drivers() [io, hw]
+    let p = port()
+    test.assert(amg8833.bring_up(p))
+    // The bus, normal mode and 50 ms, the initial reset and 2 ms, 10 frames a
+    // second, and 100 ms for the first frame.
+    test.assert_eq(log_of(p.c),
+        [0, 1, 0x00, 0x00, -1, 3, 50, -1, 1, 0x01, 0x3F, -1, 3, 2, -1, 1, 0x02, 0x00, -1, 3, 100, -1])
+
+@test
+fn test_bring_up_stops_at_the_first_write_that_fails() [io, hw]
+    var k = 1
+    while k <= 3
+        let p = port()
+        fail_at(p.c, k)
+        test.assert(not amg8833.bring_up(p))
+        k = k + 1
+
+@test
+fn test_bring_up_sends_nothing_when_the_bus_cannot_be_set_up() [io, hw]
+    let p = port()
+    p.c.st.insert(5, 1)
+    test.assert(not amg8833.bring_up(p))
+    test.assert_eq(log_of(p.c), [0])
+
+// ── The bus functions ────────────────────────────────────────────────
+
+// The register file over the bus: 8-bit register address, then data.
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(2, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        logp(self.c, 1)
+        for b in data
+            logp(self.c, b as Int)
+        logp(self.c, -1)
+        if fails(self.c) or addr != at(self.c.st, 4)
+            return false
+        for i in 1..data.len()
+            self.c.regs.insert(data[0] as Int + i - 1, data[i] as Int)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        logp(self.c, 2)
+        logp(self.c, tx[0] as Int)
+        logp(self.c, n)
+        logp(self.c, -1)
+        if fails(self.c) or addr != at(self.c.st, 4)
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, at(self.c.regs, tx[0] as Int + i) as u8)
+        Some(out)
+
+fn wiring() -> DeviceWiring
+    dev_bus.wiring_i2c(0, 0x69)
+
+@test
+fn test_the_bus_functions_read_and_write_one_transaction_each() [io, hw]
+    let c = chip()
+    let bus = FakeI2c { c: c }
+    test.assert(amg8833.i2c_setup(bus, wiring()))
+    test.assert_eq(at(c.st, 2), 400000)
+    test.assert(not amg8833.i2c_setup(bus, dev_bus.wiring_spi(0, 4)))
+    test.assert(amg8833.i2c_write_reg(bus, wiring(), 0x02, 1))
+    test.assert_eq(at(c.regs, 2), 1)
+    var b: AmgBytes = Vec.new()
+    test.assert(amg8833.i2c_read_into(bus, wiring(), 0x02, 1, var b))
+    test.assert_eq(b.len(), 1)
+    test.assert_eq(b[0] as Int, 1)
+    log_clear(c)
+    test.assert(amg8833.i2c_read_into(bus, wiring(), 0x80, 128, var b))
+    test.assert_eq(b.len(), 128)
+    test.assert_eq(log_of(c), [2, 0x80, 128, -1])
+    // More than the buffer holds is refused without a transaction.
+    log_clear(c)
+    test.assert(not amg8833.i2c_read_into(bus, wiring(), 0x80, 129, var b))
+    test.assert_eq(b.len(), 0)
+    test.assert_eq(log_of(c).len(), 0)
+    // The other address does not answer.
+    test.assert(not amg8833.i2c_write_reg(bus, dev_bus.wiring_i2c(0, 0x68), 0x02, 1))
+    test.assert(not amg8833.i2c_read_into(bus, dev_bus.wiring_i2c(0, 0x68), 0x02, 1, var b))
+
+// ── The type over the host's absent bus ──────────────────────────────
+
+fn thermometer_read<T: Thermometer>(t: T) -> ?TempMilliC [hw]
+    if t.temp_start() < 0
+        return None
+    t.temp_read()
+
+@test
+fn test_the_type_over_absent_hardware() [io, hw]
+    let d = Amg8833.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, wiring())
+    test.assert(not d.begin())
+    var f: AmgFrame = Vec.new()
+    test.assert(not d.frame(var f))
+    test.assert_eq(d.frame_period_us(), 0)
+    test.assert(not d.set_rate_hz(10))
+    test.assert_eq(d.rate_hz(), 0)
+    test.assert(not d.set_power(0x10))
+    test.assert_eq(d.power(), -1)
+    test.assert(not d.reset_flags())
+    test.assert(not d.reset_all())
+    test.assert(not d.set_moving_average(true))
+    test.assert(not d.moving_average())
+    test.assert(not d.set_interrupt(true, true))
+    test.assert(not d.set_levels(30000, 0, 0))
+    var lv: Vec[Int; 3] = Vec.new()
+    test.assert(not d.levels(var lv))
+    test.assert_eq(d.status(), -1)
+    test.assert(not d.clear_status(0x02))
+    var t: AmgBytes = Vec.new()
+    test.assert(not d.interrupt_table(var t))
+    test.assert_eq(d.temp_start(), 0)
+    test.assert(d.temp_read() == None)
+    test.assert(thermometer_read(d) == None)
+    test.assert(d.temp_read_after(5, 10) == None)
+    test.assert(d.temp_read_after(15, 10) == None)

@@ -1,0 +1,28 @@
+[package]
+name        = "amg8833-nv"
+version     = "0.1.0"
+description = "A driver for Panasonic's AMG8833 Grid-EYE, an 8 by 8 infrared array sensor on I2C: the 64 pixel temperatures read in one burst into a buffer the caller owns, in millidegrees Celsius, the thermistor as devices-nv's Thermometer, the frame rate of 1 or 10 Hz, the power modes with the two stand-by intervals, the software resets, the moving-average output, and the interrupt with its upper, lower and hysteresis levels and its pixel table."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["amg8833", "amg88xx", "grid-eye", "panasonic", "thermal", "infrared", "thermopile", "image-sensor", "i2c", "sensor", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/amg8833-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+# The package is checked at the embedded tier, the strictest one, so
+# every function in it is also valid at rt and system.
+[tier]
+tier = "embedded"
+
+[docs.pages]
+"README.md" = "Reading a Panasonic AMG8833 Grid-EYE thermal array from a device program"
+
+[dependencies]
+# The board's I2C bus and timer handles, and the I2cBus and Timer traits
+# they implement.
+embedded-hal-nv = "^0.3.3"
+# The Thermometer trait, the wiring record a board's device table hands
+# `attach`, and the register helpers.
+devices-nv      = "^0.3.3"
