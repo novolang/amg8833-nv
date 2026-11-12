@@ -1,6 +1,7 @@
 // amg8833 — Panasonic's AMG8833 Grid-EYE, an 8 by 8 infrared array sensor on
 // I2C: a frame of 64 pixel temperatures in millidegrees Celsius read into a
-// buffer the caller owns, and the thermistor as devices-nv's `Thermometer`.
+// buffer the caller owns (devices-nv's `ThermalImager`), and the thermistor as
+// devices-nv's `Thermometer`.
 //
 // The document is "Specifications for Infrared Array Sensor Grid-EYE AMG88**"
 // (Panasonic Corporation, Automation Controls Business Unit, 26 pages, dated
@@ -62,21 +63,20 @@
 //     normal mode (section 4-10 (1)); `power_set` is the way out.
 
 use embedded_hal.{ BoardI2c, BoardTimer, I2cBus, Timer }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, DevBurst }
 use dev_thermo.{ TempMilliC, Thermometer }
+use dev_thermal.{ ThermalFrame, ThermalImager }
 
-// The bytes of a register read: the whole pixel block is 128.
-pub alias AmgBytes = Vec[u8; 128]
-
-// A frame: the 64 pixel temperatures in millidegrees Celsius, in the order
+// The pixels in a frame.  A frame is the first 64 pixels of devices-nv's
+// `ThermalFrame`, the pixel temperatures in millidegrees Celsius in the order
 // of the pixel registers, pixel 1 first.
-pub alias AmgFrame = Vec[Int; 64]
-
-// The pixels in a frame.
 pub const PIXELS = 64
 
 // The width of a row of the array.
 pub const COLS = 8
+
+// The height of the array.
+pub const ROWS = 8
 
 // The address with the AD_SELECT pin on GND.
 pub const ADDR_GND = 0x68
@@ -136,7 +136,7 @@ let MAMOD    = 0x20
 // registers in one transaction, one register written, and a pause.
 pub trait AmgPort
     fn setup(self) -> Bool [hw]
-    fn read_regs(self, reg: Int, n: Int, var dst: AmgBytes) -> Bool [hw]
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBurst) -> Bool [hw]
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
     fn pause_ms(self, ms: Int) [hw]
 
@@ -145,16 +145,8 @@ pub trait AmgPort
 // Reads `n` bytes from the register `reg` into `dst` in one transaction:
 // whether the part answered.  `n` larger than 128 is refused.
 pub fn i2c_read_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
-                                var dst: AmgBytes) -> Bool [hw]
-    dst.clear()
-    if n > dst.capacity()
-        return false
-    match dev_bus.wiring_read(bus, w, reg, n)
-        Some(b) =>
-            for x in b
-                let _ = dst.push(x)
-            true
-        None    => false
+                                var dst: DevBurst) -> Bool [hw]
+    dev_bus.wiring_read_burst_into(bus, w, reg, n, var dst)
 
 // Writes one register: whether the part acknowledged.
 pub fn i2c_write_reg<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
@@ -229,7 +221,7 @@ pub fn power_set<P: AmgPort>(p: P, mode: Int) -> Bool [hw]
 
 // The power mode the part holds, or -1.
 pub fn power_get<P: AmgPort>(p: P) -> Int [hw]
-    var b: AmgBytes = Vec.new()
+    var b: DevBurst = Vec.new()
     if not p.read_regs(REG_PCTL, 1, var b)
         return -1
     b[0] as Int
@@ -256,7 +248,7 @@ pub fn rate_set<P: AmgPort>(p: P, hz: Int) -> Bool [hw]
 
 // The frame rate in frames a second, 1 or 10, or 0 when the part did not answer.
 pub fn rate_get<P: AmgPort>(p: P) -> Int [hw]
-    var b: AmgBytes = Vec.new()
+    var b: DevBurst = Vec.new()
     if not p.read_regs(REG_FPSC, 1, var b)
         return 0
     if (b[0] as Int & 1) == 1
@@ -270,6 +262,11 @@ pub fn period_us<P: AmgPort>(p: P) -> Int [hw]
     if hz == 0
         return 0
     1000000 / hz
+
+// The frame rate in thousandths of a frame a second, 10000 or 1000, or 0 when the
+// part did not answer.
+pub fn rate_mhz<P: AmgPort>(p: P) -> Int [hw]
+    rate_get(p) * 1000
 
 // Sets the moving-average output, twice moving average on or off, with the
 // unlock sequence: whether every write was acknowledged.
@@ -289,7 +286,7 @@ pub fn average_set<P: AmgPort>(p: P, on: Bool) -> Bool [hw]
 
 // Whether the moving average is on, or `false` when the part did not answer.
 pub fn average_get<P: AmgPort>(p: P) -> Bool [hw]
-    var b: AmgBytes = Vec.new()
+    var b: DevBurst = Vec.new()
     if not p.read_regs(REG_AVE, 1, var b)
         return false
     (b[0] as Int & MAMOD) != 0
@@ -330,7 +327,7 @@ pub fn levels_set<P: AmgPort>(p: P, high: Int, low: Int, hys: Int) -> Bool [hw]
 // The three levels as the part holds them in millidegrees, in the order upper,
 // lower, hysteresis, in `out`: whether the part answered.
 pub fn levels_get<P: AmgPort>(p: P, var out: Vec[Int; 3]) -> Bool [hw]
-    var b: AmgBytes = Vec.new()
+    var b: DevBurst = Vec.new()
     out.clear()
     if not p.read_regs(REG_INT_HI, 6, var b)
         return false
@@ -342,7 +339,7 @@ pub fn levels_get<P: AmgPort>(p: P, var out: Vec[Int; 3]) -> Bool [hw]
 // The status register: bit 3 the thermistor overflowed, bit 2 a pixel overflowed,
 // bit 1 an interrupt is flagged; -1 when the part did not answer.
 pub fn status_get<P: AmgPort>(p: P) -> Int [hw]
-    var b: AmgBytes = Vec.new()
+    var b: DevBurst = Vec.new()
     if not p.read_regs(REG_STAT, 1, var b)
         return -1
     b[0] as Int & 0x0E
@@ -354,19 +351,19 @@ pub fn status_clear<P: AmgPort>(p: P, mask: Int) -> Bool [hw]
 
 // The interrupt table, eight bytes, pixels 1 to 8 in the first: whether the part
 // answered.
-pub fn table_get<P: AmgPort>(p: P, var out: AmgBytes) -> Bool [hw]
+pub fn table_get<P: AmgPort>(p: P, var out: DevBurst) -> Bool [hw]
     p.read_regs(REG_INT_TAB, 8, var out)
 
 // Whether the table flags the pixel with the 0-based register index `i` (pixel
 // `i + 1`).  `false` outside 0 to 63.
-pub fn table_flag(var t: AmgBytes, i: Int) -> Bool
+pub fn table_flag(var t: DevBurst, i: Int) -> Bool
     if i < 0 or i > 63 or t.len() < 8
         return false
     ((t[i / 8] as Int >> (i % 8)) & 1) == 1
 
 // The thermistor in millidegrees Celsius, or `None` when the part did not answer.
 pub fn thermistor_read<P: AmgPort>(p: P) -> ?Int [hw]
-    var b: AmgBytes = Vec.new()
+    var b: DevBurst = Vec.new()
     if not p.read_regs(REG_TTH, 2, var b)
         return None
     Some(thermistor_milli_c(b[0] as Int | (b[1] as Int << 8)))
@@ -378,15 +375,15 @@ pub fn temp_of<P: AmgPort>(p: P) -> ?TempMilliC [hw]
         None    => None
 
 // Reads the 64 pixels in one transaction of 128 bytes into `out` as millidegrees
-// Celsius, pixel 1 first: whether the part answered.  On a part that did not
-// answer `out` is empty.
-pub fn frame_read<P: AmgPort>(p: P, var out: AmgFrame) -> Bool [hw]
-    var b: AmgBytes = Vec.new()
+// Celsius, pixel 1 first: whether the part answered.  `out` holds 64 pixels
+// afterwards; on a part that did not answer it is empty.
+pub fn frame_read<P: AmgPort>(p: P, var out: ThermalFrame) -> Bool [hw]
+    var b: DevBurst = Vec.new()
     out.clear()
     if not p.read_regs(REG_PIXELS, 128, var b)
         return false
     for i in 0..PIXELS
-        let _ = out.push(pixel_milli_c(b[2 * i] as Int | (b[2 * i + 1] as Int << 8)))
+        let _ = out.push(pixel_milli_c(b[2 * i] as Int | (b[2 * i + 1] as Int << 8)) as i32)
     true
 
 // Brings the part up: the bus at 400 kHz, normal mode, the initial reset, the
@@ -418,7 +415,7 @@ impl AmgPort for Amg8833
     fn setup(self) -> Bool [hw]
         i2c_setup(self.bus, self.w)
 
-    fn read_regs(self, reg: Int, n: Int, var dst: AmgBytes) -> Bool [hw]
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBurst) -> Bool [hw]
         i2c_read_into(self.bus, self.w, reg, n, var dst)
 
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
@@ -436,10 +433,6 @@ impl Amg8833
     // Brings the part up at 10 frames a second: whether it answered.
     fn begin(self) -> Bool [hw]
         bring_up(self)
-
-    // Reads a frame of 64 pixels in millidegrees Celsius into `out`.
-    fn frame(self, var out: AmgFrame) -> Bool [hw]
-        frame_read(self, var out)
 
     // The time a frame takes in microseconds, 100,000 or 1,000,000; 0 when the part
     // did not answer.
@@ -488,8 +481,31 @@ impl Amg8833
     fn clear_status(self, mask: Int) -> Bool [hw]
         status_clear(self, mask)
 
-    fn interrupt_table(self, var out: AmgBytes) -> Bool [hw]
+    fn interrupt_table(self, var out: DevBurst) -> Bool [hw]
         table_get(self, var out)
+
+impl ThermalImager[hw] for Amg8833
+    fn thermal_cols(self) -> Int [hw]
+        COLS
+
+    fn thermal_rows(self) -> Int [hw]
+        ROWS
+
+    // The part converts continuously at its frame rate, so a start has nothing
+    // to begin: 0.  A frame read before the first conversion holds zeros.
+    fn thermal_start(self) -> Int [hw]
+        0
+
+    // The 64 pixels in the order of the pixel registers, pixel 1 first (the
+    // bottom right of the array as the specification draws it); `pixel_index`
+    // gives the index of a row and a column.
+    fn thermal_read(self, var out: ThermalFrame) -> Bool [hw]
+        frame_read(self, var out)
+
+    // The frame rate in thousandths of a frame a second: 10000 or 1000, and 0
+    // when the part did not answer.
+    fn thermal_rate_mhz(self) -> Int [hw]
+        rate_mhz(self)
 
 impl Thermometer[hw] for Amg8833
     // The thermistor converts continuously.

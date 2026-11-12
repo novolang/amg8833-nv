@@ -43,7 +43,8 @@ ambient 25 C  hottest 31 C at row 3 col 4
 use embedded_hal.{ BoardI2c, BoardTimer }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_bus
-use amg8833.{ Amg8833, AmgFrame }
+use dev_thermal.{ ThermalFrame, ThermalImager }
+use amg8833.{ Amg8833 }
 
 // Writes `n`, 0 or more, in decimal.  Formatting into a string would allocate,
 // which @tier(embedded) refuses, so each digit goes out as a byte.  An Int has
@@ -70,7 +71,7 @@ fn degrees(milli_c: Int) [hw]
 
 // The index of the hottest pixel of the frame.
 @tier(embedded)
-fn hottest(var frame: AmgFrame) -> Int
+fn hottest(var frame: ThermalFrame) -> Int
     var best = 0
     for i in 1..64
         if frame[i] > frame[best]
@@ -86,9 +87,9 @@ fn main() [hw]
     hal.timer.delay_ms(50)
     if not sensor.begin()
         hal.uart.write("no answer from the sensor at 0x69\n")
-    var frame: AmgFrame = Vec.new()
+    var frame: ThermalFrame = Vec.new()
     while true
-        if sensor.frame(var frame)
+        if sensor.thermal_read(var frame)
             match sensor.temp_read()
                 Some(t) =>
                     hal.uart.write("ambient ")
@@ -96,7 +97,7 @@ fn main() [hw]
                 None => hal.uart.write("ambient ?")
             let h = hottest(var frame)
             hal.uart.write(" C  hottest ")
-            degrees(frame[h])
+            degrees(frame[h] as Int)
             // The index counts back from pixel 64 at the top left.
             hal.uart.write(" C at row ")
             digits((63 - h) / 8)
@@ -120,7 +121,7 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 | Image | Flash | Of which program |
 |---|---|---|
-| `nrf52840-dk` | 14,400 B | 3,746 B |
+| `nrf52840-dk` | 14,400 B | 3,750 B |
 | `nrf54lm20-dk` | 15,864 B | 4,182 B |
 
 The numbers are from the build's memory report. Flash also holds the runtime and the
@@ -138,12 +139,15 @@ rig carries one.
 
 | Module | Holds |
 |---|---|
-| `amg8833` | The `Amg8833` type, the `AmgPort` trait the register functions run over, the conversions, and the functions for the power modes, the resets, the frame rate, the moving average, the interrupt and the frame. |
+| `amg8833` | The `Amg8833` type, which implements `ThermalImager` and `Thermometer`, the `AmgPort` trait the register functions run over, the conversions, and the functions for the power modes, the resets, the frame rate, the moving average, the interrupt and the frame. |
 
 ## The frame
 
-`Amg8833.frame(var out)` reads registers 0x80 to 0xFF in one transaction and fills
-`out`, a `Vec[Int; 64]` (`AmgFrame`), with the pixels in the order of the registers,
+`Amg8833` implements devices-nv's `ThermalImager`: `thermal_cols()` and `thermal_rows()`
+answer 8 and 8, `thermal_start()` answers 0 because the part converts continuously, and
+`thermal_rate_mhz()` answers 10000 or 1000.  `thermal_read(var out)` reads registers 0x80
+to 0xFF in one transaction through devices-nv's `DevBurst` and fills the first 64 places of
+`out`, a `ThermalFrame` (`Vec[i32; 768]`), with the pixels in the order of the registers,
 pixel 1 first, each in millidegrees Celsius. A pixel is a 12-bit two's complement count
 of 0.25 degrees. The specification draws pixel 1 at the bottom right and pixel 64 at
 the top left, so `pixel_index(row, col)` gives the index of the pixel `row` rows from
@@ -176,6 +180,14 @@ it in millidegrees, rounded to the nearest.
    lower one, and the interrupt table (`interrupt_table`, `table_flag`) flags the pixels.
 8. The part has no identification register, so the type implements no `Identifiable`.
 
+## Where the traits fall short
+
+- `ThermalFrame` holds the 32 by 24 image of the MLX90640, so a program that reads this
+  8 by 8 part holds 3 KB for a frame of 64 pixels.  The trait has one buffer shape for
+  both parts.
+- `ThermalImager` has no async form, because the embedded tier refuses `async fn`.  The
+  part converts in the background, so a program reads at the frame rate.
+
 ## What is not included
 
 - The register-by-register reads of the Arduino library: a frame is one transaction.
@@ -188,7 +200,7 @@ it in millidegrees, rounded to the nearest.
 
 - [mlx90640-nv](https://novo-lang.org/packages/mlx90640-nv) reads a thermal array of 32 by
   24 pixels.
-- [devices-nv](https://novo-lang.org/packages/devices-nv) defines `Thermometer`;
+- [devices-nv](https://novo-lang.org/packages/devices-nv) defines `Thermometer`, `ThermalImager` and `DevBurst`;
   [embedded-hal-nv](https://novo-lang.org/packages/embedded-hal-nv) defines `I2cBus` and
   `Timer`.
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+The package takes devices-nv and embedded-hal-nv by path until 0.4.0 is published.
+
+- `Amg8833` implements devices-nv's `ThermalImager`: `thermal_cols`, `thermal_rows`,
+  `thermal_start`, `thermal_read` and `thermal_rate_mhz`.  The inherent `frame(var out)` is
+  gone; `thermal_read(var out)` replaces it and fills a `ThermalFrame` (`Vec[i32; 768]`)
+  with the same 64 pixels in the same order.  *Migration:* `var frame: ThermalFrame`
+  for `AmgFrame`, and `frame[i] as Int` where an `Int` is wanted.
+- The aliases `AmgBytes` and `AmgFrame` are gone.  The 128-byte buffer is devices-nv's
+  `DevBurst`, read with `wiring_read_burst_into`, and `AmgPort.read_regs`, `table_get` and
+  `table_flag` take it.
+- New: the constant `ROWS` and the function `rate_mhz`.
+
 ## 0.1.0
 
 The first release: a driver for Panasonic's AMG8833 Grid-EYE 8 by 8 infrared array sensor.

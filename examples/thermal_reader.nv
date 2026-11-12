@@ -20,8 +20,8 @@
  * left of the array as the specification draws it.
  *
  * The program reads the thermistor through devices-nv's Thermometer trait and
- * the frame through `Amg8833.frame`, which fills a buffer of 64 millidegree
- * values that the program owns.
+ * the frame through ThermalImager's `thermal_read`, which fills a buffer of
+ * millidegree values that the program owns (the first 64 of a ThermalFrame).
  *
  * Effects the program declares: [hw], for the I2C bus, the UART and the timer.
  * It allocates nothing after it starts.
@@ -33,7 +33,8 @@
 use embedded_hal.{ BoardI2c, BoardTimer }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_bus
-use amg8833.{ Amg8833, AmgFrame }
+use dev_thermal.{ ThermalFrame, ThermalImager }
+use amg8833.{ Amg8833 }
 
 // Writes `n`, 0 or more, in decimal.  Formatting into a string would allocate,
 // which @tier(embedded) refuses, so each digit goes out as a byte.  An Int has
@@ -60,7 +61,7 @@ fn degrees(milli_c: Int) [hw]
 
 // The index of the hottest pixel of the frame.
 @tier(embedded)
-fn hottest(var frame: AmgFrame) -> Int
+fn hottest(var frame: ThermalFrame) -> Int
     var best = 0
     for i in 1..64
         if frame[i] > frame[best]
@@ -76,9 +77,9 @@ fn main() [hw]
     hal.timer.delay_ms(50)
     if not sensor.begin()
         hal.uart.write("no answer from the sensor at 0x69\n")
-    var frame: AmgFrame = Vec.new()
+    var frame: ThermalFrame = Vec.new()
     while true
-        if sensor.frame(var frame)
+        if sensor.thermal_read(var frame)
             match sensor.temp_read()
                 Some(t) =>
                     hal.uart.write("ambient ")
@@ -86,7 +87,7 @@ fn main() [hw]
                 None    => hal.uart.write("ambient ?")
             let h = hottest(var frame)
             hal.uart.write(" C  hottest ")
-            degrees(frame[h])
+            degrees(frame[h] as Int)
             // The index counts back from pixel 64 at the top left.
             hal.uart.write(" C at row ")
             digits((63 - h) / 8)

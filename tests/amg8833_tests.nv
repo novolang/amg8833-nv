@@ -12,10 +12,11 @@
 
 use std.test
 use embedded_hal.{ BoardI2c, BoardTimer, I2cBus }
-use dev_bus.{ DeviceWiring }
+use dev_bus.{ DeviceWiring, DevBurst }
+use dev_thermal.{ ThermalFrame, ThermalImager }
 use dev_thermo.{ TempMilliC, Thermometer }
 use amg8833
-use amg8833.{ Amg8833, AmgPort, AmgBytes, AmgFrame }
+use amg8833.{ Amg8833, AmgPort }
 
 struct Chip
     regs: HashMap<Int, Int>
@@ -63,7 +64,7 @@ impl AmgPort for FakePort
         logp(self.c, 0)
         at(self.c.st, 5) == 0
 
-    fn read_regs(self, reg: Int, n: Int, var dst: AmgBytes) -> Bool [hw]
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBurst) -> Bool [hw]
         dst.clear()
         logp(self.c, 2)
         logp(self.c, reg)
@@ -204,10 +205,12 @@ fn test_the_frame_rate_is_one_or_ten_a_second() [io, hw]
     test.assert_eq(at(p.c.regs, 2), 1)
     test.assert_eq(amg8833.rate_get(p), 1)
     test.assert_eq(amg8833.period_us(p), 1000000)
+    test.assert_eq(amg8833.rate_mhz(p), 1000)
     test.assert(amg8833.rate_set(p, 10))
     test.assert_eq(at(p.c.regs, 2), 0)
     test.assert_eq(amg8833.rate_get(p), 10)
     test.assert_eq(amg8833.period_us(p), 100000)
+    test.assert_eq(amg8833.rate_mhz(p), 10000)
     log_clear(p.c)
     test.assert(not amg8833.rate_set(p, 5))
     test.assert(not amg8833.rate_set(p, 0))
@@ -219,6 +222,8 @@ fn test_the_frame_rate_is_one_or_ten_a_second() [io, hw]
     test.assert_eq(amg8833.rate_get(p), 0)
     fail_at(p.c, 1)
     test.assert_eq(amg8833.period_us(p), 0)
+    fail_at(p.c, 1)
+    test.assert_eq(amg8833.rate_mhz(p), 0)
 
 @test
 fn test_the_moving_average_is_unlocked_before_it_is_set() [io, hw]
@@ -343,7 +348,7 @@ fn test_the_interrupt_table_flags_the_pixels_over_a_level() [io, hw]
     // Pixel 12 is bit 3 of INT1 (0x11).
     p.c.regs.insert(0x11, 0x08)
     p.c.regs.insert(0x17, 0x80)
-    var t: AmgBytes = Vec.new()
+    var t: DevBurst = Vec.new()
     test.assert(amg8833.table_get(p, var t))
     test.assert_eq(t.len(), 8)
     test.assert(amg8833.table_flag(var t, 11))
@@ -352,7 +357,7 @@ fn test_the_interrupt_table_flags_the_pixels_over_a_level() [io, hw]
     test.assert(not amg8833.table_flag(var t, 0))
     test.assert(not amg8833.table_flag(var t, -1))
     test.assert(not amg8833.table_flag(var t, 64))
-    var empty: AmgBytes = Vec.new()
+    var empty: DevBurst = Vec.new()
     test.assert(not amg8833.table_flag(var empty, 11))
     fail_at(p.c, 1)
     test.assert(not amg8833.table_get(p, var t))
@@ -393,13 +398,16 @@ fn test_a_frame_is_one_read_of_128_bytes_from_0x80() [io, hw]
         let raw = (n * 4 - 100) & 0xFFF
         p.c.regs.insert(0x80 + 2 * (n - 1), raw & 0xFF)
         p.c.regs.insert(0x81 + 2 * (n - 1), (raw >> 8) & 0x0F)
-    var out: AmgFrame = Vec.new()
+    var out: ThermalFrame = Vec.new()
     test.assert(amg8833.frame_read(p, var out))
     test.assert_eq(log_of(p.c), [2, 0x80, 128, -1])
     test.assert_eq(out.len(), 64)
     test.assert_eq(out[24], 0)
     test.assert_eq(out[0], -24000)
     test.assert_eq(out[63], 39000)
+    // The buffer is a `ThermalFrame` and 64 of its pixels are the image.
+    test.assert_eq(dev_thermal.thermal_hottest(out, 8, 8), 63)
+    test.assert_eq(dev_thermal.thermal_index(8, 8, 7, 7), 63)
     // A part that does not answer leaves the buffer empty.
     fail_at(p.c, 1)
     test.assert(not amg8833.frame_read(p, var out))
@@ -479,7 +487,7 @@ fn test_the_bus_functions_read_and_write_one_transaction_each() [io, hw]
     test.assert(not amg8833.i2c_setup(bus, dev_bus.wiring_spi(0, 4)))
     test.assert(amg8833.i2c_write_reg(bus, wiring(), 0x02, 1))
     test.assert_eq(at(c.regs, 2), 1)
-    var b: AmgBytes = Vec.new()
+    var b: DevBurst = Vec.new()
     test.assert(amg8833.i2c_read_into(bus, wiring(), 0x02, 1, var b))
     test.assert_eq(b.len(), 1)
     test.assert_eq(b[0] as Int, 1)
@@ -507,8 +515,14 @@ fn thermometer_read<T: Thermometer>(t: T) -> ?TempMilliC [hw]
 fn test_the_type_over_absent_hardware() [io, hw]
     let d = Amg8833.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, wiring())
     test.assert(not d.begin())
-    var f: AmgFrame = Vec.new()
-    test.assert(not d.frame(var f))
+    var f: ThermalFrame = Vec.new()
+    test.assert(not d.thermal_read(var f))
+    test.assert_eq(f.len(), 0)
+    test.assert_eq(d.thermal_cols(), 8)
+    test.assert_eq(d.thermal_rows(), 8)
+    test.assert_eq(d.thermal_start(), 0)
+    test.assert_eq(d.thermal_rate_mhz(), 0)
+    test.assert(not d.thermal_read_after(5, 10, var f))
     test.assert_eq(d.frame_period_us(), 0)
     test.assert(not d.set_rate_hz(10))
     test.assert_eq(d.rate_hz(), 0)
@@ -524,7 +538,7 @@ fn test_the_type_over_absent_hardware() [io, hw]
     test.assert(not d.levels(var lv))
     test.assert_eq(d.status(), -1)
     test.assert(not d.clear_status(0x02))
-    var t: AmgBytes = Vec.new()
+    var t: DevBurst = Vec.new()
     test.assert(not d.interrupt_table(var t))
     test.assert_eq(d.temp_start(), 0)
     test.assert(d.temp_read() == None)
